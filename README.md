@@ -1,5 +1,7 @@
 # RefMap
 
+**Live demo:** https://ykang8.github.io/refmap-handoff/
+
 RefMap turns music references into timestamped creative direction for artists, producers, and engineers. Add reference tracks to a project, play YouTube references inside the app, drop markers at the exact moments that matter, and turn them into a Creative Brief.
 
 It is a static, single-page web app: no backend, no login, no database. Demo data is hard-coded and your changes are kept in the browser's local storage.
