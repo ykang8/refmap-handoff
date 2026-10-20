@@ -48,3 +48,9 @@ Thumbs.db
 # Replit
 .cache/
 .local/
+
+# Local env
+.env
+.env.local
+# Pre-migration Replit originals (local reference only)
+.original-replit/
