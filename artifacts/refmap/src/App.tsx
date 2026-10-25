@@ -1,30 +1,40 @@
-import { createContext, useContext, useEffect, useState, type FormEvent, type ReactNode } from 'react';
+import { createContext, useContext, useEffect, useRef, useState, type CSSProperties, type DragEvent, type FormEvent, type ReactNode } from 'react';
 import { ErrorBoundary } from '@/components/error-boundary';
 import { Toaster } from '@/components/ui/toaster';
 import { TooltipProvider } from '@/components/ui/tooltip';
+import { Timeline } from '@/components/timeline';
 import {
-  ArrowLeft, ArrowUpRight, Check, ChevronLeft, Clipboard, Copy, Disc3, FileText,
-  FolderOpen, Headphones, Link2, ListMusic, Menu, MoreHorizontal, Music2,
-  Pause, Pencil, Play, Plus, Search, Settings, Share2, SlidersHorizontal,
-  Trash2, X, Zap,
+  ArrowUpRight, Check, ChevronRight, Copy, Disc3, FileAudio, FileText, Link2, ListMusic,
+  MonitorPlay, Music2, Pause, Pencil, Play, Plus, Search, Share2, SlidersHorizontal, Trash2, Upload, X,
 } from 'lucide-react';
 import {
   Link, Route, Switch, useLocation, useParams, Router as WouterRouter,
 } from 'wouter';
 import { useHashLocation } from 'wouter/use-hash-location';
+import { useAudioPlayer } from '@/hooks/use-audio-player';
 import { useYouTubePlayer } from '@/hooks/use-youtube-player';
+import { clearAudio, deleteAudio, formatBytes, maxAudioBytes, putAudio, validateAudioFile } from '@/lib/audio-store';
 import { getYouTubeVideoId } from '@/lib/youtube';
 
 type Category = 'Vocal' | 'Drums' | 'Bass' | 'Guitar' | 'Instruments' | 'Arrangement' | 'Mix' | 'Mood' | 'Other';
 type Project = { id: string; title: string; artist: string; description: string; references: Reference[]; createdAt: string; updatedAt: string };
-type Reference = { id: string; title: string; artist: string; url: string; artwork: string; notes: string; markers: Marker[] };
+/** `audio` describes an uploaded file; the file itself is stored in IndexedDB under the reference id. */
+type AudioMeta = { name: string; size: number; type: string };
+type Reference = { id: string; title: string; artist: string; url: string; artwork: string; notes: string; markers: Marker[]; audio?: AudioMeta };
+type ReferenceInput = Omit<Reference, 'id' | 'markers'>;
 type Marker = { id: string; timestamp: number; category: Category; whatILike: string; howIWantToUseIt: string; createdAt: string };
+type SetProjects = React.Dispatch<React.SetStateAction<Project[]>>;
 type Notice = (message: string, tone?: 'success' | 'error') => void;
 type ConfirmRequest = { title: string; message: string; confirmLabel: string; onConfirm: () => void };
 const ConfirmContext = createContext<(request: ConfirmRequest) => void>(() => undefined);
 const useConfirm = () => useContext(ConfirmContext);
 const categories: Category[] = ['Vocal', 'Drums', 'Bass', 'Guitar', 'Instruments', 'Arrangement', 'Mix', 'Mood', 'Other'];
+const categoryColors: Record<Category, string> = {
+  Vocal: '#f06595', Drums: '#ff922b', Bass: '#9775fa', Guitar: '#fcc419', Instruments: '#20c997',
+  Arrangement: '#4dabf7', Mix: '#94d82d', Mood: '#e599f7', Other: '#adb5bd',
+};
 const storageKey = 'refmap-projects-v1';
+const audioAccept = 'audio/*,.mp3,.wav,.m4a,.aac,.ogg,.oga,.opus,.flac,.webm,.aif,.aiff';
 
 const id = () => `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 const now = () => new Date().toISOString();
@@ -46,9 +56,19 @@ const parseTime = (value: string) => {
 const isHttpUrl = (value: string) => {
   try { return ['http:', 'https:'].includes(new URL(value).protocol); } catch { return false; }
 };
+const plural = (count: number, word: string) => `${count} ${word}${count === 1 ? '' : 's'}`;
+const markerCount = (project: Project) => project.references.reduce((sum, reference) => sum + reference.markers.length, 0);
+const isTyping = (target: EventTarget | null) => target instanceof HTMLElement && (['INPUT', 'TEXTAREA', 'SELECT'].includes(target.tagName) || target.isContentEditable);
+
+type SourceKind = 'audio' | 'youtube' | 'link' | 'none';
+const sourceOf = (reference: Reference): SourceKind => reference.audio ? 'audio' : getYouTubeVideoId(reference.url) ? 'youtube' : reference.url ? 'link' : 'none';
+const sourceLabels: Record<SourceKind, string> = { audio: 'Audio file', youtube: 'YouTube', link: 'Link', none: 'No source' };
+
+// Set by the Reference map so the player opens at the clicked marker.
+let pendingSeek: { referenceId: string; time: number } | null = null;
 
 // Demo data. Videos are official uploads checked to play in an embedded player; marker times are illustrative and stay within each video's length.
-const youTubeThumb = (videoId: string) => `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`;
+const youTubeThumb = (videoId: string) => `https://i.ytimg.com/vi/${videoId}/mqdefault.jpg`;
 const seedProjects = (): Project[] => [{
   id: 'night-transit',
   title: 'Night Transit',
@@ -99,6 +119,7 @@ const seedProjects = (): Project[] => [{
     },
   ],
 }];
+
 
 // Bump when the demo project changes so browsers with older saved data receive it once.
 const demoVersion = '2';
@@ -164,8 +185,17 @@ function App() {
   );
 }
 
+
 function ConfirmModal({ request, onClose }: { request: ConfirmRequest; onClose: () => void }) {
-  return <Modal title={request.title} onClose={onClose}><p className="confirm-message">{request.message}</p><div className="modal-footer"><button className="button button-secondary" onClick={onClose} autoFocus data-testid="button-confirm-cancel">Cancel</button><button className="button button-primary button-destructive" onClick={() => { request.onConfirm(); onClose(); }} data-testid="button-confirm-ok">{request.confirmLabel}</button></div></Modal>;
+  return (
+    <Modal title={request.title} onClose={onClose} size="small">
+      <p className="confirm-message">{request.message}</p>
+      <div className="modal-footer">
+        <button className="button" onClick={onClose} autoFocus data-testid="button-confirm-cancel">Cancel</button>
+        <button className="button button-danger" onClick={() => { request.onConfirm(); onClose(); }} data-testid="button-confirm-ok">{request.confirmLabel}</button>
+      </div>
+    </Modal>
+  );
 }
 
 function RoutedErrorBoundary({ children }: { children: ReactNode }) {
@@ -173,27 +203,18 @@ function RoutedErrorBoundary({ children }: { children: ReactNode }) {
   return <ErrorBoundary resetKey={location}>{children}</ErrorBoundary>;
 }
 
+/* ---------- Shared pieces ---------- */
+
 function Shell({ children }: { children: ReactNode }) {
   const [location] = useLocation();
-  const navItems = [
-    { href: '/', label: 'My Projects', icon: FolderOpen },
-    { href: '/settings', label: 'Settings', icon: Settings },
-  ];
+  const onProjects = location === '/' || location.startsWith('/projects');
   return (
-    <div className="app-shell">
-      <aside className="sidebar">
-        <Link href="/" className="brand" data-testid="link-brand"><span className="brand-mark" /><span className="brand-name">ref<b>map</b></span></Link>
-        <div className="side-label">Workspace</div>
-        <nav className="nav-list" aria-label="Main navigation">
-          {navItems.map(({ href, label, icon: Icon }) => <Link key={href} href={href} className={`nav-link ${location === href || (href === '/' && location.startsWith('/projects')) ? 'active' : ''}`} data-testid={`link-nav-${label.toLowerCase().replace(' ', '-')}`}><Icon />{label}</Link>)}
-        </nav>
-        <div className="sidebar-footer"><strong>SESSION NOTEBOOK</strong>Turn instinct into language.<br />Keep the useful parts.</div>
-      </aside>
+    <div className="app">
       <header className="topbar">
-        <Link href="/" className="brand" data-testid="link-mobile-brand"><span className="brand-mark" /><span className="brand-name">ref<b>map</b></span></Link>
-        <nav className="mobile-nav">
-          <Link href="/" className={location === '/' || location.startsWith('/projects') ? 'active' : ''} data-testid="link-mobile-projects"><FolderOpen size={18} /></Link>
-          <Link href="/settings" className={location === '/settings' ? 'active' : ''} data-testid="link-mobile-settings"><Settings size={18} /></Link>
+        <Link href="/" className="brand" data-testid="link-brand"><BrandMark /> RefMap</Link>
+        <nav className="topnav" aria-label="Main navigation">
+          <Link href="/" className={onProjects ? 'active' : ''} data-testid="link-nav-projects">Projects</Link>
+          <Link href="/settings" className={location === '/settings' ? 'active' : ''} data-testid="link-nav-settings">Settings</Link>
         </nav>
       </header>
       <main className="main">{children}</main>
@@ -201,7 +222,103 @@ function Shell({ children }: { children: ReactNode }) {
   );
 }
 
-function Dashboard({ projects, setProjects, notify }: { projects: Project[]; setProjects: React.Dispatch<React.SetStateAction<Project[]>>; notify: Notice }) {
+function BrandMark() {
+  return (
+    <svg className="brand-mark" viewBox="0 0 20 20" aria-hidden="true">
+      {[[2, 8], [6, 4], [10, 1], [14, 5], [18, 9]].map(([x, y]) => <rect key={x} x={x - 1.25} y={y} width="2.5" height={20 - y * 2} rx="1.25" />)}
+    </svg>
+  );
+}
+
+function Breadcrumbs({ items }: { items: { label: string; href?: string }[] }) {
+  return (
+    <nav className="breadcrumbs" aria-label="Breadcrumb">
+      {items.map((item, index) => (
+        <span key={index} className="breadcrumb">
+          {index > 0 && <ChevronRight size={13} aria-hidden="true" />}
+          {item.href ? <Link href={item.href} data-testid={`link-breadcrumb-${index}`}>{item.label}</Link> : <span aria-current="page">{item.label}</span>}
+        </span>
+      ))}
+    </nav>
+  );
+}
+
+function PageHeader({ title, meta, description, actions }: { title: string; meta?: ReactNode; description?: string; actions?: ReactNode }) {
+  return (
+    <div className="page-header">
+      <div className="page-heading">
+        <h1>{title}</h1>
+        {meta && <p className="page-meta">{meta}</p>}
+        {description && <p className="page-description">{description}</p>}
+      </div>
+      {actions && <div className="page-actions">{actions}</div>}
+    </div>
+  );
+}
+
+function EmptyState({ icon: Icon, title, body, action }: { icon: typeof Music2; title: string; body: string; action?: ReactNode }) {
+  return (
+    <div className="empty-state">
+      <Icon size={22} aria-hidden="true" />
+      <h3>{title}</h3>
+      <p>{body}</p>
+      {action}
+    </div>
+  );
+}
+
+function Cover({ reference, size = 'small' }: { reference: Reference; size?: 'small' | 'large' }) {
+  const [failed, setFailed] = useState(false);
+  return (
+    <span className={`cover cover-${size}`} aria-hidden="true">
+      {reference.artwork && !failed
+        // YouTube's 16:9 "mq" thumbnail has no letterbox bars, unlike the 4:3 "hq" one.
+        ? <img src={reference.artwork.replace(/(i\.ytimg\.com\/vi\/[^/]+\/)hqdefault\.jpg$/, '$1mqdefault.jpg')} alt="" onError={() => setFailed(true)} />
+        : sourceOf(reference) === 'audio' ? <FileAudio size={size === 'large' ? 40 : 18} /> : initials(reference.title)}
+    </span>
+  );
+}
+
+function SourceBadge({ reference }: { reference: Reference }) {
+  const kind = sourceOf(reference);
+  const Icon = { audio: FileAudio, youtube: MonitorPlay, link: Link2, none: Disc3 }[kind];
+  return <span className={`source-badge source-${kind}`}><Icon size={12} aria-hidden="true" />{sourceLabels[kind]}</span>;
+}
+
+function CategoryChip({ category }: { category: Category }) {
+  return <span className="chip" style={{ '--c': categoryColors[category] } as CSSProperties}><i aria-hidden="true" />{category}</span>;
+}
+
+function CategoryFilter({ value, onChange }: { value: 'All' | Category; onChange: (value: 'All' | Category) => void }) {
+  return (
+    <div className="filter-row" role="group" aria-label="Filter by category">
+      <button className={`filter ${value === 'All' ? 'active' : ''}`} onClick={() => onChange('All')} aria-pressed={value === 'All'} data-testid="filter-category-all">All</button>
+      {categories.map((category) => (
+        <button key={category} className={`filter ${value === category ? 'active' : ''}`} style={{ '--c': categoryColors[category] } as CSSProperties} onClick={() => onChange(category)} aria-pressed={value === category} data-testid={`filter-category-${category.toLowerCase()}`}>
+          <i aria-hidden="true" />{category}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+function Segmented<T extends string>({ value, options, onChange, label }: { value: T; options: { value: T; label: string; testId?: string }[]; onChange: (value: T) => void; label: string }) {
+  return (
+    <div className="segmented" role="group" aria-label={label}>
+      {options.map((option) => (
+        <button key={option.value} type="button" className={value === option.value ? 'active' : ''} aria-pressed={value === option.value} onClick={() => onChange(option.value)} data-testid={option.testId}>{option.label}</button>
+      ))}
+    </div>
+  );
+}
+
+function IconButton({ label, onClick, children, danger, testId }: { label: string; onClick: () => void; children: ReactNode; danger?: boolean; testId?: string }) {
+  return <button type="button" className={`icon-button ${danger ? 'icon-button-danger' : ''}`} onClick={onClick} aria-label={label} title={label} data-testid={testId}>{children}</button>;
+}
+
+/* ---------- Projects ---------- */
+
+function Dashboard({ projects, setProjects, notify }: { projects: Project[]; setProjects: SetProjects; notify: Notice }) {
   const [, setLocation] = useLocation();
   const confirm = useConfirm();
   const [modal, setModal] = useState<'new' | 'edit' | null>(null);
@@ -219,36 +336,55 @@ function Dashboard({ projects, setProjects, notify }: { projects: Project[]; set
   };
   const remove = (project: Project) => confirm({
     title: 'Delete project?', message: `“${project.title}” and all of its references and markers will be removed. This cannot be undone.`, confirmLabel: 'Delete project',
-    onConfirm: () => { setProjects((items) => items.filter((item) => item.id !== project.id)); notify('Project deleted'); },
+    onConfirm: () => {
+      setProjects((items) => items.filter((item) => item.id !== project.id));
+      deleteAudio(project.references.filter((reference) => reference.audio).map((reference) => reference.id));
+      notify('Project deleted');
+    },
   });
+  const newButton = <button className="button button-primary" onClick={() => setModal('new')} data-testid="button-new-project"><Plus size={15} /> New project</button>;
   return (
     <div className="page">
-      <div className="page-header">
-        <div><div className="eyebrow">RefMap / Workspace</div><h1>My Projects</h1><p className="subtle" style={{ marginTop: 12 }}>The references behind the records you are making.</p></div>
-        <button className="button button-primary" onClick={() => setModal('new')} data-testid="button-new-project"><Plus /> New project</button>
-      </div>
-      {projects.length === 0 ? <div className="empty-state"><Music2 size={28} /><h3>Your workspace is quiet.</h3><p>Start a project to collect the sounds, moments, and decisions you want to carry into the room.</p><button className="button button-primary" onClick={() => setModal('new')} data-testid="button-empty-new-project">Create your first project</button></div> : (
-        <div className="project-grid">
-          {projects.map((project) => {
-            const markerCount = project.references.reduce((sum, ref) => sum + ref.markers.length, 0);
-            return <article className="panel project-card" key={project.id} data-testid={`card-project-${project.id}`}>
-              <div className="project-card-main" onClick={() => setLocation(`/projects/${project.id}`)} onKeyDown={(event) => { if (event.key === 'Enter') setLocation(`/projects/${project.id}`); }} role="button" tabIndex={0} style={{ textAlign: 'left', background: 'transparent', border: 0, color: 'inherit' }} data-testid={`button-open-project-${project.id}`}>
-                <div className="project-card-top"><span className="project-art">{initials(project.title)}</span><button className="icon-button" onClick={(event) => { event.stopPropagation(); setEditing(project); setModal('edit'); }} aria-label={`Edit ${project.title}`} data-testid={`button-edit-project-${project.id}`}><MoreHorizontal size={17} /></button></div>
-                <div className="project-title">{project.title}</div><div className="project-description">{project.description || 'No project description yet.'}</div>
-                <div className="project-meta"><div><span className="meta-number">{project.references.length}</span><span className="meta-label">references</span></div><div><span className="meta-number">{markerCount}</span><span className="meta-label">markers</span></div></div>
-              </div>
-              <div className="project-card-footer"><span>edited {formatDate(project.updatedAt)}</span><button className="button button-ghost button-small button-danger" onClick={() => remove(project)} data-testid={`button-delete-project-${project.id}`}><Trash2 size={13} /> Delete</button></div>
-            </article>;
-          })}
-          <button className="panel new-project-card" onClick={() => setModal('new')} data-testid="button-new-project-card"><span><Plus /><span>New project</span></span></button>
-        </div>
-      )}
+      <PageHeader title="Projects" meta={projects.length ? plural(projects.length, 'project') : undefined} actions={projects.length ? newButton : undefined} />
+      {projects.length === 0
+        ? <EmptyState icon={Music2} title="No projects yet" body="A project collects the reference tracks for one song or record." action={newButton} />
+        : (
+          <div className="project-grid">
+            {projects.map((project) => (
+              <article className="project-card" key={project.id} data-testid={`card-project-${project.id}`}>
+                <Link href={`/projects/${project.id}`} className="project-card-link" data-testid={`button-open-project-${project.id}`}>
+                  <ProjectCover project={project} />
+                  <span className="project-card-body">
+                    <strong>{project.title}</strong>
+                    <span className="muted">{project.artist || 'No artist'}</span>
+                    <span className="project-card-meta">{plural(project.references.length, 'reference')} · {plural(markerCount(project), 'marker')}</span>
+                  </span>
+                </Link>
+                <div className="project-card-footer">
+                  <span>Edited {formatDate(project.updatedAt)}</span>
+                  <span className="row-actions">
+                    <IconButton label={`Edit ${project.title}`} onClick={() => { setEditing(project); setModal('edit'); }} testId={`button-edit-project-${project.id}`}><Pencil size={15} /></IconButton>
+                    <IconButton label={`Delete ${project.title}`} onClick={() => remove(project)} danger testId={`button-delete-project-${project.id}`}><Trash2 size={15} /></IconButton>
+                  </span>
+                </div>
+              </article>
+            ))}
+          </div>
+        )}
       {modal && <ProjectModal mode={modal} initial={modal === 'edit' ? editing : undefined} onClose={() => { setModal(null); setEditing(undefined); }} onSave={modal === 'new' ? create : update} />}
     </div>
   );
 }
 
-function Workspace({ projects, setProjects, notify }: { projects: Project[]; setProjects: React.Dispatch<React.SetStateAction<Project[]>>; notify: Notice }) {
+function ProjectCover({ project }: { project: Project }) {
+  const tiles = project.references.slice(0, 4);
+  if (tiles.length === 0) return <span className="project-cover project-cover-empty" aria-hidden="true">{initials(project.title)}</span>;
+  return <span className={`project-cover tiles-${tiles.length}`} aria-hidden="true">{tiles.map((reference) => <Cover key={reference.id} reference={reference} />)}</span>;
+}
+
+/* ---------- Project workspace ---------- */
+
+function Workspace({ projects, setProjects, notify }: { projects: Project[]; setProjects: SetProjects; notify: Notice }) {
   const { projectId } = useParams<{ projectId: string }>();
   const [, setLocation] = useLocation();
   const project = projects.find((item) => item.id === projectId);
@@ -259,38 +395,76 @@ function Workspace({ projects, setProjects, notify }: { projects: Project[]; set
   const [editingReference, setEditingReference] = useState<Reference | undefined>();
   const confirm = useConfirm();
   if (!project) return <Missing title="Project not found" back="/" />;
-  const updateProject = (next: Project) => setProjects((items) => items.map((item) => item.id === next.id ? { ...next, updatedAt: now() } : item));
-  const addReference = (data: Omit<Reference, 'id' | 'markers'>) => {
-    updateProject({ ...project, references: [...project.references, { ...data, id: id(), markers: [] }] });
+  // Functional updates by id, because saving an uploaded file is async and `project` may be stale afterwards.
+  const updateReferences = (change: (references: Reference[]) => Reference[]) => setProjects((items) => items.map((item) => item.id === project.id ? { ...item, references: change(item.references), updatedAt: now() } : item));
+  const addReference = async (data: ReferenceInput, file: File | null) => {
+    const referenceId = id();
+    if (file) await putAudio(referenceId, file);
+    updateReferences((references) => [...references, { ...data, id: referenceId, markers: [] }]);
     setModal(null); notify('Reference added');
   };
-  const editReference = (data: Omit<Reference, 'id' | 'markers'>) => {
-    if (!editingReference) return;
-    updateProject({ ...project, references: project.references.map((item) => item.id === editingReference.id ? { ...item, ...data } : item) });
-    setModal(null); setEditingReference(undefined); notify('Reference details saved');
+  const editReference = async (data: ReferenceInput, file: File | null) => {
+    const target = editingReference;
+    if (!target) return;
+    if (file) await putAudio(target.id, file);
+    updateReferences((references) => references.map((item) => item.id === target.id ? { ...item, ...data } : item));
+    if (target.audio && !data.audio) deleteAudio([target.id]);
+    setModal(null); setEditingReference(undefined); notify('Reference saved');
   };
   const editProject = (data: Pick<Project, 'title' | 'artist' | 'description'>) => {
-    updateProject({ ...project, ...data }); setModal(null); notify('Project details saved');
+    setProjects((items) => items.map((item) => item.id === project.id ? { ...item, ...data, updatedAt: now() } : item));
+    setModal(null); notify('Project details saved');
   };
   const removeReference = (reference: Reference) => confirm({
-    title: 'Remove reference?', message: `“${reference.title}” and its ${reference.markers.length} ${reference.markers.length === 1 ? 'marker' : 'markers'} will be removed from this project.`, confirmLabel: 'Remove reference',
-    onConfirm: () => { updateProject({ ...project, references: project.references.filter((item) => item.id !== reference.id) }); notify('Reference removed'); },
+    title: 'Remove reference?', message: `“${reference.title}” and its ${plural(reference.markers.length, 'marker')} will be removed from this project.${reference.audio ? ' The uploaded audio file is deleted too.' : ''}`, confirmLabel: 'Remove reference',
+    onConfirm: () => {
+      updateReferences((references) => references.filter((item) => item.id !== reference.id));
+      if (reference.audio) deleteAudio([reference.id]);
+      notify('Reference removed');
+    },
   });
+  const term = search.trim().toLowerCase();
   const filtered = project.references.filter((reference) => {
-    const term = search.toLowerCase();
-    const matchSearch = !term || `${reference.title} ${reference.artist} ${reference.notes}`.toLowerCase().includes(term);
-    const matchCategory = filter === 'All' || reference.markers.some((marker) => marker.category === filter);
-    return matchSearch && matchCategory;
+    const text = [reference.title, reference.artist, reference.notes, ...reference.markers.flatMap((marker) => [marker.whatILike, marker.howIWantToUseIt])].join(' ').toLowerCase();
+    return (!term || text.includes(term)) && (filter === 'All' || reference.markers.some((marker) => marker.category === filter));
   });
   const allMarkers = project.references.flatMap((reference) => reference.markers.map((marker) => ({ marker, reference }))).filter(({ marker }) => filter === 'All' || marker.category === filter);
+  const open = (referenceId: string) => setLocation(`/projects/${project.id}/references/${referenceId}`);
+  const addButton = <button className="button button-primary" onClick={() => setModal('reference')} data-testid="button-add-reference"><Plus size={15} /> Add reference</button>;
   return (
     <div className="page">
-      <div className="workspace-header">
-        <Link href="/" className="crumb" data-testid="link-back-projects"><ChevronLeft size={13} /> All projects</Link>
-        <div className="workspace-title-row"><div><div className="eyebrow">Project workspace</div><h1>{project.title}</h1><div className="workspace-title-meta"><span>{project.artist || 'No artist'}</span><span>{project.references.length} references</span><span>{project.references.reduce((sum, reference) => sum + reference.markers.length, 0)} markers</span></div></div><div className="workspace-actions"><button className="button button-secondary" onClick={() => setModal('edit')} data-testid="button-edit-workspace"><Pencil size={14} /> Edit project</button><Link className="button button-primary" href={`/projects/${project.id}/brief`} data-testid="link-open-brief"><FileText size={14} /> Creative brief</Link></div></div>
-        <div className="workspace-tabs"><button className={`tab ${view === 'tracks' ? 'active' : ''}`} onClick={() => setView('tracks')} data-testid="tab-tracks-view">Tracks view</button><button className={`tab ${view === 'map' ? 'active' : ''}`} onClick={() => setView('map')} data-testid="tab-reference-map">Reference map</button></div>
+      <Breadcrumbs items={[{ label: 'Projects', href: '/' }, { label: project.title }]} />
+      <PageHeader
+        title={project.title}
+        meta={<>{project.artist || 'No artist'} · {plural(project.references.length, 'reference')} · {plural(markerCount(project), 'marker')}</>}
+        description={project.description}
+        actions={<>
+          <button className="button" onClick={() => setModal('edit')} data-testid="button-edit-workspace"><Pencil size={14} /> Edit</button>
+          <Link className="button" href={`/projects/${project.id}/brief`} data-testid="link-open-brief"><FileText size={14} /> Creative brief</Link>
+          {addButton}
+        </>}
+      />
+      <div className="toolbar">
+        <Segmented<typeof view> label="View" value={view} onChange={setView} options={[{ value: 'tracks', label: 'Tracks', testId: 'tab-tracks-view' }, { value: 'map', label: 'Map', testId: 'tab-reference-map' }]} />
+        {view === 'tracks' && project.references.length > 0 && (
+          <label className="search">
+            <Search size={15} aria-hidden="true" />
+            <input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search titles and notes" aria-label="Search references" data-testid="input-search-references" />
+          </label>
+        )}
       </div>
-      {view === 'tracks' ? <><div className="toolbar"><div className="search-wrap"><Search size={15} /><input className="input search-input" value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search references" aria-label="Search references" data-testid="input-search-references" /></div><button className="button button-primary" onClick={() => setModal('reference')} data-testid="button-add-reference"><Plus size={15} /> Add reference</button></div><div className="filter-list" style={{ marginBottom: 19 }}><button className={`filter ${filter === 'All' ? 'active' : ''}`} onClick={() => setFilter('All')} data-testid="filter-category-all">All</button>{categories.map((category) => <button key={category} className={`filter ${filter === category ? 'active' : ''}`} onClick={() => setFilter(category)} data-testid={`filter-category-${category.toLowerCase()}`}>{category}</button>)}</div>{filtered.length === 0 ? <div className="empty-state"><ListMusic size={27} /><h3>{project.references.length ? 'No references match.' : 'Build the reference shelf.'}</h3><p>{project.references.length ? 'Try a different search or category.' : 'Add a track, then capture the exact moments that explain what you hear.'}</p>{!project.references.length && <button className="button button-primary" onClick={() => setModal('reference')} data-testid="button-empty-add-reference"><Plus size={14} /> Add first reference</button>}</div> : <div className="reference-list">{filtered.map((reference) => <ReferenceRow key={reference.id} reference={reference} onOpen={() => setLocation(`/projects/${project.id}/references/${reference.id}`)} onEdit={() => { setEditingReference(reference); setModal('editReference'); }} onDelete={() => removeReference(reference)} />)}</div>}</> : <ReferenceMap references={project.references} markers={allMarkers}onOpen={(referenceId) => setLocation(`/projects/${project.id}/references/${referenceId}`)} />}
+      {project.references.length > 0 && <CategoryFilter value={filter} onChange={setFilter} />}
+      {project.references.length === 0
+        ? <EmptyState icon={ListMusic} title="No references yet" body="Add a YouTube link or upload an audio file, then mark the moments you want to remember." action={<button className="button button-primary" onClick={() => setModal('reference')} data-testid="button-empty-add-reference"><Plus size={15} /> Add reference</button>} />
+        : view === 'tracks'
+          ? filtered.length === 0
+            ? <EmptyState icon={Search} title="No matches" body="Try a different search or category." />
+            : (
+              <div className="track-list">
+                {filtered.map((reference) => <TrackRow key={reference.id} index={project.references.indexOf(reference) + 1} reference={reference} onOpen={() => open(reference.id)} onEdit={() => { setEditingReference(reference); setModal('editReference'); }} onDelete={() => removeReference(reference)} />)}
+              </div>
+            )
+          : <ReferenceMap references={project.references} markers={allMarkers} filtered={filter !== 'All'} onOpen={(referenceId, time) => { pendingSeek = time === undefined ? null : { referenceId, time }; open(referenceId); }} />}
       {modal === 'reference' && <ReferenceModal onClose={() => setModal(null)} onSave={addReference} />}
       {modal === 'editReference' && <ReferenceModal initial={editingReference} onClose={() => { setModal(null); setEditingReference(undefined); }} onSave={editReference} />}
       {modal === 'edit' && <ProjectModal mode="edit" initial={project} onClose={() => setModal(null)} onSave={editProject} />}
@@ -298,114 +472,360 @@ function Workspace({ projects, setProjects, notify }: { projects: Project[]; set
   );
 }
 
-function ReferenceRow({ reference, onOpen, onEdit, onDelete }: { reference: Reference; onOpen: () => void; onEdit: () => void; onDelete: () => void }) {
-  return <article className="reference-row" data-testid={`row-reference-${reference.id}`}><button className="cover" onClick={onOpen} data-testid={`button-open-reference-${reference.id}`}>{reference.artwork ? <img src={reference.artwork} alt="" onError={(event) => { event.currentTarget.style.display = 'none'; }} /> : initials(reference.title)}</button><button onClick={onOpen} style={{ textAlign: 'left', background: 'transparent', border: 0, color: 'inherit', minWidth: 0 }} data-testid={`button-reference-title-${reference.id}`}><div className="reference-title">{reference.title}</div><div className="reference-artist">{reference.artist}</div>{reference.notes && <div className="reference-notes">{reference.notes}</div>}<div className="reference-stats" style={{ marginTop: 9 }}><span><Zap size={13} /> {reference.markers.length} markers</span>{reference.url && <span><Link2 size={13} /> linked</span>}</div></button><div className="reference-row-actions"><button className="button button-ghost button-small" onClick={onOpen} data-testid={`button-listen-reference-${reference.id}`}><Play size={13} /> Open</button><button className="button button-ghost button-small" onClick={onEdit} data-testid={`button-edit-reference-${reference.id}`}><Pencil size={13} /></button><button className="button button-ghost button-small button-danger" onClick={onDelete} data-testid={`button-delete-reference-${reference.id}`}><Trash2 size={13} /></button></div></article>;
+function TrackRow({ index, reference, onOpen, onEdit, onDelete }: { index: number; reference: Reference; onOpen: () => void; onEdit: () => void; onDelete: () => void }) {
+  const counts = categories.map((category) => ({ category, count: reference.markers.filter((marker) => marker.category === category).length })).filter(({ count }) => count);
+  return (
+    <div className="track-row" data-testid={`row-reference-${reference.id}`}>
+      <button className="track-main" onClick={onOpen} data-testid={`button-open-reference-${reference.id}`}>
+        <span className="track-index">{index}</span>
+        <Cover reference={reference} />
+        <span className="track-title"><strong>{reference.title}</strong><span>{reference.artist}</span></span>
+        <SourceBadge reference={reference} />
+        <span className="track-markers" title={counts.map(({ category, count }) => `${category}: ${count}`).join(', ') || 'No markers'}>
+          <span className="dot-stack" aria-hidden="true">{counts.map(({ category }) => <i key={category} style={{ background: categoryColors[category] }} />)}</span>
+          {plural(reference.markers.length, 'marker')}
+        </span>
+      </button>
+      <span className="row-actions">
+        <IconButton label={`Edit ${reference.title}`} onClick={onEdit} testId={`button-edit-reference-${reference.id}`}><Pencil size={15} /></IconButton>
+        <IconButton label={`Remove ${reference.title}`} onClick={onDelete} danger testId={`button-delete-reference-${reference.id}`}><Trash2 size={15} /></IconButton>
+      </span>
+    </div>
+  );
 }
 
-function ReferenceMap({ references, markers, onOpen }: { references: Reference[]; markers: { marker: Marker; reference: Reference }[]; onOpen: (id: string) => void }) {
+function ReferenceMap({ references, markers, filtered, onOpen }: { references: Reference[]; markers: { marker: Marker; reference: Reference }[]; filtered: boolean; onOpen: (referenceId: string, time?: number) => void }) {
   const [groupBy, setGroupBy] = useState<'track' | 'category'>('track');
-  const columns = categories.map((category) => ({ category, markers: markers.filter(({ marker }) => marker.category === category) })).filter(({ markers: items }) => items.length);
-  if (columns.length === 0) return <div className="empty-state"><SlidersHorizontal size={27} /><h3>Your map is waiting for markers.</h3><p>Open a reference and mark the moments you want to turn into direction.</p></div>;
-  const toggle = <div className="map-group-toggle" role="group" aria-label="Group reference map">{(['track', 'category'] as const).map((value) => <button key={value} className={`filter ${groupBy === value ? 'active' : ''}`} onClick={() => setGroupBy(value)} aria-pressed={groupBy === value} data-testid={`button-map-group-${value}`}>By {value}</button>)}</div>;
+  if (markers.length === 0) return <EmptyState icon={SlidersHorizontal} title={filtered ? 'No markers in this category' : 'No markers yet'} body={filtered ? 'Choose another category or All.' : 'Open a reference and add markers while you listen.'} />;
+  const toggle = <Segmented<typeof groupBy> label="Group map" value={groupBy} onChange={setGroupBy} options={[{ value: 'track', label: 'By track', testId: 'button-map-group-track' }, { value: 'category', label: 'By category', testId: 'button-map-group-category' }]} />;
+  const markerButton = (marker: Marker, reference: Reference, showSong: boolean) => (
+    <button className="map-marker" key={marker.id} onClick={() => onOpen(reference.id, marker.timestamp)} style={{ '--c': categoryColors[marker.category] } as CSSProperties} data-testid={`button-map-marker-${marker.id}`}>
+      <span className="map-marker-head"><span className="time">{formatTime(marker.timestamp)}</span>{showSong ? <span className="map-song">{reference.title}</span> : <CategoryChip category={marker.category} />}</span>
+      <span className="map-note">{marker.whatILike}</span>
+    </button>
+  );
   if (groupBy === 'track') {
     // `markers` is already category-filtered, so derive each track's list from it rather than from reference.markers.
-    const tracks = references.map((reference, index) => ({ reference, index, markers: markers.filter((item) => item.reference.id === reference.id).map(({ marker }) => marker).sort((a, b) => a.timestamp - b.timestamp) }));
-    return <>{toggle}<div className="map-tracks">{tracks.map(({ reference, index, markers: items }) => <section className="map-track" key={reference.id} data-testid={`section-map-track-${reference.id}`}><button className="map-track-head" onClick={() => onOpen(reference.id)} data-testid={`button-map-track-${reference.id}`}><span className="map-track-number">{(index + 1).toString().padStart(2, '0')}</span><span className="map-track-title"><strong>{reference.title}</strong><span>{reference.artist}</span></span><span className="map-track-count">{items.length} {items.length === 1 ? 'marker' : 'markers'}</span></button>{items.length === 0 ? <p className="map-track-empty">No markers here yet.</p> : <div className="map-track-markers">{items.map((marker) => <button className="map-marker" key={marker.id} onClick={() => onOpen(reference.id)} data-testid={`button-map-marker-${marker.id}`}><div className="map-track-marker-head"><span className="map-time">{formatTime(marker.timestamp)}</span><span className="category-pill">{marker.category}</span></div><div className="map-note">{marker.whatILike}</div></button>)}</div>}</section>)}</div></>;
+    const tracks = references.map((reference, index) => ({ reference, index, items: markers.filter((item) => item.reference.id === reference.id).map(({ marker }) => marker).sort((a, b) => a.timestamp - b.timestamp) }));
+    return (
+      <>
+        <div className="map-controls">{toggle}</div>
+        <div className="map-tracks">
+          {tracks.map(({ reference, index, items }) => (
+            <section className="map-track" key={reference.id} data-testid={`section-map-track-${reference.id}`}>
+              <button className="map-track-head" onClick={() => onOpen(reference.id)} data-testid={`button-map-track-${reference.id}`}>
+                <span className="track-index">{index + 1}</span>
+                <Cover reference={reference} />
+                <span className="track-title"><strong>{reference.title}</strong><span>{reference.artist}</span></span>
+                <span className="muted">{plural(items.length, 'marker')}</span>
+              </button>
+              {items.length === 0 ? <p className="map-track-empty">{filtered ? 'No markers in this category.' : 'No markers yet.'}</p> : <div className="map-markers">{items.map((marker) => markerButton(marker, reference, false))}</div>}
+            </section>
+          ))}
+        </div>
+      </>
+    );
   }
-  return <>{toggle}<div className="map-grid">{columns.map(({ category, markers: items }) =><section className="map-column" key={category}><div className="map-column-head"><h3>{category}</h3><span>{items.length.toString().padStart(2, '0')}</span></div>{items.map(({ marker, reference }) => <button className="map-marker" key={marker.id} onClick={() => onOpen(reference.id)} style={{ width: '100%', background: 'transparent', border: 0, color: 'inherit', textAlign: 'left' }} data-testid={`button-map-marker-${marker.id}`}><div className="map-time">{formatTime(marker.timestamp)}</div><div className="map-song">{reference.title} <span style={{ color: 'hsl(var(--muted-foreground))', fontWeight: 400 }}>— {reference.artist}</span></div><div className="map-note">{marker.whatILike}</div></button>)}</section>)}</div></>;
+  const columns = categories.map((category) => ({ category, items: markers.filter(({ marker }) => marker.category === category) })).filter(({ items }) => items.length);
+  return (
+    <>
+      <div className="map-controls">{toggle}</div>
+      <div className="map-columns">
+        {columns.map(({ category, items }) => (
+          <section className="map-column" key={category}>
+            <div className="map-column-head"><CategoryChip category={category} /><span className="muted">{items.length}</span></div>
+            {items.map(({ marker, reference }) => markerButton(marker, reference, true))}
+          </section>
+        ))}
+      </div>
+    </>
+  );
 }
 
-function ReferencePlayer({ projects, setProjects, notify }: { projects: Project[]; setProjects: React.Dispatch<React.SetStateAction<Project[]>>; notify: Notice }) {
+/* ---------- Reference player ---------- */
+
+function ReferencePlayer({ projects, setProjects, notify }: { projects: Project[]; setProjects: SetProjects; notify: Notice }) {
   const { projectId, referenceId } = useParams<{ projectId: string; referenceId: string }>();
-  const [, setLocation] = useLocation();
   const project = projects.find((item) => item.id === projectId);
   const reference = project?.references.find((item) => item.id === referenceId);
-  const [currentTime, setCurrentTime] = useState(0);
+  const [manualTime, setManualTime] = useState(0);
   const [modal, setModal] = useState<'new' | Marker | null>(null);
+  const [audioVersion, setAudioVersion] = useState(0);
   const confirm = useConfirm();
-  const videoId = reference ? getYouTubeVideoId(reference.url) : null;
+  const kind = reference ? sourceOf(reference) : 'none';
+  const videoId = reference && kind === 'youtube' ? getYouTubeVideoId(reference.url) : null;
+  const audio = useAudioPlayer(reference && kind === 'audio' ? reference.id : null, audioVersion);
   const video = useYouTubePlayer(videoId);
+  // One transport for whichever source is playable; without one, the timeline is a manual marker-positioning aid.
+  const engine = kind === 'audio' && audio.status === 'ready' ? audio : kind === 'youtube' && video.status === 'ready' ? video : null;
+  const loading = (kind === 'audio' && audio.status === 'loading') || (kind === 'youtube' && video.status === 'loading');
+  const manualDuration = Math.max(300, ...(reference?.markers ?? []).map((marker) => marker.timestamp + 30));
+  const time = engine ? engine.currentTime : manualTime;
+  const total = engine ? Math.max(1, Math.floor(engine.duration)) : manualDuration;
+  const seek = (seconds: number) => { if (engine) engine.seek(seconds); else setManualTime(seconds); };
+  const togglePlay = () => { if (!engine) return; if (engine.playing) engine.pause(); else engine.play(); };
+  const openNewMarker = () => { engine?.pause(); setModal('new'); };
+
+  // Jump to a marker chosen on the Reference map once the source can seek.
+  useEffect(() => {
+    if (!reference || pendingSeek?.referenceId !== reference.id || loading) return;
+    const target = pendingSeek.time;
+    pendingSeek = null;
+    seek(target);
+  }, [reference?.id, loading, engine]);
+
+  // Space: play/pause · M: add marker · ←/→: move 5 s (Shift: 15 s).
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (modal || isTyping(event.target) || event.metaKey || event.ctrlKey || event.altKey) return;
+      if (event.key === ' ' && engine && !(event.target instanceof HTMLButtonElement)) { event.preventDefault(); togglePlay(); }
+      else if (event.key.toLowerCase() === 'm' && !loading) { event.preventDefault(); openNewMarker(); }
+      else if ((event.key === 'ArrowLeft' || event.key === 'ArrowRight') && !(event.target instanceof HTMLElement && event.target.getAttribute('role') === 'slider')) {
+        event.preventDefault();
+        const step = (event.shiftKey ? 15 : 5) * (event.key === 'ArrowLeft' ? -1 : 1);
+        seek(Math.min(total, Math.max(0, Math.round(time + step))));
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  });
+
   if (!project || !reference) return <Missing title="Reference not found" back={project ? `/projects/${project.id}` : '/'} />;
-  // A YouTube link drives the timeline from the embedded player; otherwise the timeline is a manual marker-positioning aid
-  // long enough for a typical track and for every existing marker.
-  const useVideo = videoId !== null && video.status !== 'error';
-  const manualDuration = Math.max(300, ...reference.markers.map((marker) => marker.timestamp + 30));
-  const time = useVideo ? video.currentTime : currentTime;
-  const total = useVideo ? Math.max(1, Math.floor(video.duration)) : manualDuration;
-  const togglePlay = () => { if (video.playing) video.pause(); else video.play(); };
-  const seek = (seconds: number) => { if (useVideo) video.seek(seconds); else setCurrentTime(seconds); };
-  const openNewMarker = () => { if (useVideo) video.pause(); setModal('new'); };
-  const updateReference = (next: Reference) => setProjects((items) => items.map((item) => item.id === project.id ? { ...item, references: item.references.map((ref) => ref.id === next.id ? next : ref), updatedAt: now() } : item));
+  const updateReference = (change: (reference: Reference) => Reference) => setProjects((items) => items.map((item) => item.id === project.id ? { ...item, references: item.references.map((ref) => ref.id === reference.id ? change(ref) : ref), updatedAt: now() } : item));
   const saveMarker = (data: Omit<Marker, 'id' | 'createdAt'>) => {
     const current = typeof modal === 'object' ? modal : undefined;
     const marker: Marker = { ...data, id: current?.id || id(), createdAt: current?.createdAt || now() };
-    updateReference({ ...reference, markers: current ? reference.markers.map((item) => item.id === current.id ? marker : item) : [...reference.markers, marker] });
+    updateReference((ref) => ({ ...ref, markers: current ? ref.markers.map((item) => item.id === current.id ? marker : item) : [...ref.markers, marker] }));
     setModal(null); notify(current ? 'Marker updated' : `Marker added at ${formatTime(marker.timestamp)}`);
   };
   const deleteMarker = (marker: Marker) => confirm({
     title: 'Delete marker?', message: `The ${marker.category} marker at ${formatTime(marker.timestamp)} will be removed.`, confirmLabel: 'Delete marker',
-    onConfirm: () => { updateReference({ ...reference, markers: reference.markers.filter((item) => item.id !== marker.id) }); notify('Marker deleted'); },
+    onConfirm: () => { updateReference((ref) => ({ ...ref, markers: ref.markers.filter((item) => item.id !== marker.id) })); notify('Marker deleted'); },
   });
+  const reattach = async (file: File) => {
+    const problem = validateAudioFile(file);
+    if (problem) { notify(problem, 'error'); return; }
+    try { await putAudio(reference.id, file); } catch { notify('Could not save the audio file — browser storage is full or blocked', 'error'); return; }
+    updateReference((ref) => ({ ...ref, audio: { name: file.name, size: file.size, type: file.type } }));
+    setAudioVersion((version) => version + 1);
+    notify('Audio file attached');
+  };
+  const markers = reference.markers.slice().sort((a, b) => a.timestamp - b.timestamp);
+  const status = kind === 'audio'
+    ? { loading: 'Loading audio…', missing: 'This audio file isn’t stored in this browser. Attach it again to play it here.', error: 'This audio file couldn’t be played. Try attaching it again or use another format.' }[audio.status as 'loading' | 'missing' | 'error']
+    : kind === 'youtube'
+      ? { loading: 'Loading YouTube player…', error: 'This video can’t be played outside YouTube. Listen there and set marker times by dragging the timeline.' }[video.status as 'loading' | 'error']
+      : kind === 'link' ? 'This link can’t be played here. Listen in another tab and drag the timeline to the moment you want.' : 'This reference has no audio. Edit it to add a YouTube link or an audio file.';
+
   return (
     <div className="page">
-      <Link href={`/projects/${project.id}`} className="crumb" data-testid="link-back-workspace"><ChevronLeft size={13} /> {project.title}</Link>
-      <div className={`player-layout ${videoId ? 'has-video' : ''}`}>
-        <div>{videoId ? <><div className="player-video" ref={video.containerRef} data-testid="player-youtube" />{video.status === 'loading' && <p className="player-video-note">Loading YouTube player…</p>}{video.status === 'error' && <p className="player-video-note">This video can’t be played here. Open it on YouTube and set marker times manually.</p>}</> : <div className="player-artwork">{reference.artwork ? <img src={reference.artwork} alt={`${reference.title} artwork`} onError={(event) => { event.currentTarget.style.display = 'none'; }} /> : initials(reference.title)}</div>}<div className="player-copy"><div className="eyebrow">Reference track</div><h1>{reference.title}</h1><p className="workspace-title-meta">{reference.artist}</p>{reference.url && <a className="external-link" href={reference.url} target="_blank" rel="noreferrer" data-testid="link-external-reference"><ArrowUpRight size={13} /> Open external link</a>}{reference.notes && <p className="subtle" style={{ marginTop: 23, fontSize: 12, maxWidth: 360 }}>{reference.notes}</p>}</div></div>
-        <div className="player-panel"><div className="player-topline"><span className="section-label">Listen + mark</span><span className="section-label">{reference.markers.length} markers</span></div>{useVideo ? <button className="button button-secondary button-small" onClick={togglePlay} disabled={video.status !== 'ready'} data-testid="button-play-reference">{video.playing ? <Pause size={13} /> : <Play size={13} />}{video.playing ? 'Pause' : 'Play'}</button> : <p className="player-manual-note" data-testid="text-manual-timeline">{videoId ? 'Playback is unavailable for this video.' : 'No YouTube link on this reference.'} Listen in another tab, drag the timeline to the moment, then add a marker.</p>}<div className="timeline"><input aria-label="Reference timeline" type="range" min="0" max={total} step="1" value={Math.min(Math.floor(time), total)} disabled={useVideo && video.status !== 'ready'} onChange={(event) => seek(Number(event.target.value))} style={{ width: '100%', accentColor: 'hsl(var(--primary))' }} data-testid="input-reference-timeline" /><div className="timeline-times"><span>{formatTime(time)}</span><span>{formatTime(total)}</span></div></div><div className="quick-marker"><div className="input" style={{ display: 'flex', alignItems: 'center', padding: '0 11px', color: 'hsl(var(--primary))', fontFamily: 'var(--app-font-mono)', fontSize: 12 }}>{formatTime(time)}</div><button className="button button-primary" onClick={openNewMarker} data-testid="button-quick-add-marker"><Plus size={14} /> Add marker</button></div><div className="marker-list"><div className="section-label">Captured moments</div>{reference.markers.length === 0 ? <div className="empty-state" style={{ padding: '30px 15px', marginTop: 5 }}><Headphones size={20} /><h3>No moments yet</h3><p>Move the timeline to a useful moment and add your first note.</p></div> : reference.markers.slice().sort((a, b) => a.timestamp - b.timestamp).map((marker) => <MarkerCard key={marker.id} marker={marker} onSeek={useVideo && video.status === 'ready' ? () => seek(marker.timestamp) : undefined} onEdit={() => setModal(marker)} onDelete={() => deleteMarker(marker)} />)}</div></div>
+      <Breadcrumbs items={[{ label: 'Projects', href: '/' }, { label: project.title, href: `/projects/${project.id}` }, { label: reference.title }]} />
+      <div className={`player-top ${kind === 'youtube' ? 'has-video' : ''}`}>
+        <div className="player-media">
+          {kind === 'youtube' ? <div className="video-frame" ref={video.containerRef} data-testid="player-youtube" /> : <Cover reference={reference} size="large" />}
+        </div>
+        <div className="player-info">
+          <SourceBadge reference={reference} />
+          <h1>{reference.title}</h1>
+          <p className="player-artist">{reference.artist}</p>
+          {reference.audio && <p className="player-file"><FileAudio size={13} aria-hidden="true" /> {reference.audio.name} · {formatBytes(reference.audio.size)}</p>}
+          {reference.notes && <p className="player-notes">{reference.notes}</p>}
+          {reference.url && <a className="text-link" href={reference.url} target="_blank" rel="noreferrer" data-testid="link-external-reference">{kind === 'youtube' ? 'Open on YouTube' : 'Open link'} <ArrowUpRight size={13} /></a>}
+        </div>
       </div>
+
+      <section className="deck" aria-label="Playback">
+        {status && !engine && (
+          <div className={`deck-status ${loading ? '' : 'is-warning'}`} data-testid="text-player-status">
+            <span>{status}</span>
+            {kind === 'audio' && (audio.status === 'missing' || audio.status === 'error') && <FilePickerButton label="Attach audio file" onFile={reattach} />}
+          </div>
+        )}
+        <Timeline
+          duration={total}
+          currentTime={time}
+          peaks={kind === 'audio' ? audio.peaks : null}
+          pins={markers.map((marker) => ({ id: marker.id, time: marker.timestamp, color: categoryColors[marker.category], label: marker.category }))}
+          disabled={loading}
+          formatTime={formatTime}
+          onSeek={seek}
+        />
+        <div className="transport">
+          <button className="play-button" onClick={togglePlay} disabled={!engine} aria-label={engine?.playing ? 'Pause' : 'Play'} data-testid="button-play-reference">
+            {engine?.playing ? <Pause size={18} /> : <Play size={18} />}
+          </button>
+          <span className="transport-time"><strong>{formatTime(time)}</strong> / {formatTime(total)}</span>
+          {engine && <span className="transport-hint">Space to play · M to add a marker</span>}
+          <button className="button button-primary" onClick={openNewMarker} disabled={loading} data-testid="button-quick-add-marker"><Plus size={15} /> Add marker at {formatTime(time)}</button>
+        </div>
+      </section>
+
+      <section className="marker-section">
+        <div className="section-head"><h2>Markers</h2><span className="muted">{markers.length}</span></div>
+        {markers.length === 0
+          ? <EmptyState icon={Plus} title="No markers yet" body={engine ? 'Play the track and press M (or Add marker) at a moment worth remembering.' : 'Drag the timeline to a moment, then add a marker.'} />
+          : <div className="marker-list">{markers.map((marker) => <MarkerRow key={marker.id} marker={marker} onSeek={() => seek(marker.timestamp)} onEdit={() => setModal(marker)} onDelete={() => deleteMarker(marker)} />)}</div>}
+      </section>
       {modal && <MarkerModal initial={typeof modal === 'object' ? modal : undefined} timestamp={Math.floor(time)} onClose={() => setModal(null)} onSave={saveMarker} />}
     </div>
   );
 }
 
-function MarkerCard({ marker, onSeek, onEdit, onDelete }: { marker: Marker; onSeek?: () => void; onEdit: () => void; onDelete: () => void }) {
-  return <article className="marker-card" data-testid={`card-marker-${marker.id}`}><div className="marker-head"><div>{onSeek ? <button className="marker-time marker-seek" onClick={onSeek} aria-label={`Jump to ${formatTime(marker.timestamp)}`} data-testid={`button-seek-marker-${marker.id}`}>{formatTime(marker.timestamp)}</button> : <span className="marker-time">{formatTime(marker.timestamp)}</span>}<span style={{ color: 'hsl(var(--border))', margin: '0 8px' }}>·</span><span className="category-pill">{marker.category}</span></div><div className="marker-actions"><button className="icon-button" onClick={onEdit} aria-label="Edit marker" data-testid={`button-edit-marker-${marker.id}`}><Pencil size={14} /></button><button className="icon-button" onClick={onDelete} aria-label="Delete marker" data-testid={`button-delete-marker-${marker.id}`}><Trash2 size={14} /></button></div></div><div className="marker-main"><div><div className="marker-field-label">What I like</div><div className="marker-field-value">{marker.whatILike}</div></div><div><div className="marker-field-label">How I want to use it</div><div className="marker-field-value">{marker.howIWantToUseIt}</div></div></div></article>;
+function FilePickerButton({ label, onFile }: { label: string; onFile: (file: File) => void }) {
+  const input = useRef<HTMLInputElement>(null);
+  return (
+    <>
+      <button className="button" onClick={() => input.current?.click()} data-testid="button-attach-audio"><Upload size={14} /> {label}</button>
+      <input ref={input} type="file" accept={audioAccept} hidden onChange={(event) => { const file = event.target.files?.[0]; event.target.value = ''; if (file) onFile(file); }} data-testid="input-attach-audio" />
+    </>
+  );
 }
+
+function MarkerRow({ marker, onSeek, onEdit, onDelete }: { marker: Marker; onSeek: () => void; onEdit: () => void; onDelete: () => void }) {
+  return (
+    <article className="marker-row" style={{ '--c': categoryColors[marker.category] } as CSSProperties} data-testid={`card-marker-${marker.id}`}>
+      <button className="marker-time" onClick={onSeek} aria-label={`Jump to ${formatTime(marker.timestamp)}`} data-testid={`button-seek-marker-${marker.id}`}>{formatTime(marker.timestamp)}</button>
+      <CategoryChip category={marker.category} />
+      <div className="marker-notes">
+        <p><span className="label">What I like</span>{marker.whatILike}</p>
+        <p><span className="label">How I’ll use it</span>{marker.howIWantToUseIt}</p>
+      </div>
+      <span className="row-actions">
+        <IconButton label="Edit marker" onClick={onEdit} testId={`button-edit-marker-${marker.id}`}><Pencil size={15} /></IconButton>
+        <IconButton label="Delete marker" onClick={onDelete} danger testId={`button-delete-marker-${marker.id}`}><Trash2 size={15} /></IconButton>
+      </span>
+    </article>
+  );
+}
+
+/* ---------- Creative brief ---------- */
 
 function Brief({ projects, notify }: { projects: Project[]; notify: Notice }) {
   const { projectId } = useParams<{ projectId: string }>();
   const project = projects.find((item) => item.id === projectId);
   const [, setLocation] = useLocation();
   if (!project) return <Missing title="Project not found" back="/" />;
-  const markers = project.references.flatMap((reference) => reference.markers.map((marker) => ({ marker, reference }))).sort((a, b) => a.marker.timestamp - b.marker.timestamp);
-  const briefText = `${project.title.toUpperCase()}\n${project.artist || 'Creative brief'}\n\n${markers.map(({ marker, reference }) => `[${marker.category}] ${reference.title} — ${formatTime(marker.timestamp)}\nWhat I like: ${marker.whatILike}\nHow I want to use it: ${marker.howIWantToUseIt}`).join('\n\n')}`;
+  const tracks = project.references.map((reference) => ({ reference, markers: reference.markers.slice().sort((a, b) => a.timestamp - b.timestamp) })).filter(({ markers }) => markers.length);
+  const total = markerCount(project);
+  const briefText = [
+    project.title, project.artist, project.description, '',
+    ...tracks.flatMap(({ reference, markers }) => [
+      `${reference.title} — ${reference.artist}${reference.url ? ` (${reference.url})` : ''}`,
+      ...markers.map((marker) => `  ${formatTime(marker.timestamp)} [${marker.category}] What I like: ${marker.whatILike} / How I’ll use it: ${marker.howIWantToUseIt}`),
+      '',
+    ]),
+  ].filter((line, index) => line !== '' || index > 2).join('\n').trim();
   const writeBrief = async () => {
     try { await navigator.clipboard.writeText(briefText); return true; } catch { return false; }
   };
   const copy = async () => { if (await writeBrief()) notify('Creative brief copied'); else notify('Could not copy — clipboard access is blocked', 'error'); };
   const share = async () => {
     if ('share' in navigator) {
-      try { await navigator.share({ title: `${project.title} — Creative Brief`, text: briefText }); notify('Creative brief shared'); return; }
+      try { await navigator.share({ title: `${project.title} — Creative brief`, text: briefText }); notify('Creative brief shared'); return; }
       catch (error) { if (error instanceof DOMException && error.name === 'AbortError') return; /* other failures fall back to copy */ }
     }
     if (await writeBrief()) notify('Brief copied for sharing'); else notify('Could not share or copy the brief', 'error');
   };
-  return <div className="page"><Link href={`/projects/${project.id}`} className="crumb" data-testid="link-back-brief"><ChevronLeft size={13} /> {project.title}</Link><div className="brief-header"><div><div className="eyebrow">Direction / Export</div><h1>Creative Brief</h1><p className="brief-meta">{project.artist || 'Untitled project'} · {markers.length} captured moments · edited {formatDate(project.updatedAt)}</p></div><div className="brief-actions"><button className="button button-secondary" onClick={copy} data-testid="button-copy-brief"><Copy size={14} /> Copy brief</button><button className="button button-primary" onClick={share} data-testid="button-share-brief"><Share2 size={14} /> Share</button></div></div>{markers.length === 0 ? <div className="empty-state"><FileText size={28} /><h3>The brief will take shape here.</h3><p>Capture a few moments in your references. Each one becomes a clear, usable direction.</p><button className="button button-primary" onClick={() => setLocation(`/projects/${project.id}`)} data-testid="button-brief-add-markers">Back to references</button></div> : <div className="brief-wrap"><div className="brief-columns"><div className="brief-column-title">Category</div><div className="brief-column-title">Reference</div><div className="brief-column-title">What I like</div><div className="brief-column-title">How I want to use it</div>{markers.map(({ marker, reference }) => <div className="brief-row" key={marker.id}><div className="brief-cell"><span className="category-pill">{marker.category}</span><div style={{ color: 'hsl(var(--primary))', marginTop: 9 }}>{formatTime(marker.timestamp)}</div></div><div className="brief-cell"><div className="brief-song">{reference.title}</div><div className="brief-artist">{reference.artist}</div></div><div className="brief-cell">{marker.whatILike}</div><div className="brief-cell">{marker.howIWantToUseIt}</div></div>)}</div></div>}</div>;
+  return (
+    <div className="page">
+      <Breadcrumbs items={[{ label: 'Projects', href: '/' }, { label: project.title, href: `/projects/${project.id}` }, { label: 'Creative brief' }]} />
+      <PageHeader
+        title="Creative brief"
+        meta={<>{project.title}{project.artist ? ` · ${project.artist}` : ''} · {plural(total, 'marker')} · Edited {formatDate(project.updatedAt)}</>}
+        actions={total ? <>
+          <button className="button" onClick={copy} data-testid="button-copy-brief"><Copy size={14} /> Copy</button>
+          <button className="button button-primary" onClick={share} data-testid="button-share-brief"><Share2 size={14} /> Share</button>
+        </> : undefined}
+      />
+      {total === 0
+        ? <EmptyState icon={FileText} title="Nothing to brief yet" body="Markers you add to references appear here, grouped by track." action={<button className="button button-primary" onClick={() => setLocation(`/projects/${project.id}`)} data-testid="button-brief-add-markers">Go to references</button>} />
+        : (
+          <div className="brief">
+            {project.description && <p className="brief-intro">{project.description}</p>}
+            {tracks.map(({ reference, markers }) => (
+              <section className="brief-track" key={reference.id}>
+                <header><Cover reference={reference} /><span className="track-title"><strong>{reference.title}</strong><span>{reference.artist}</span></span></header>
+                <table>
+                  <thead><tr><th>Time</th><th>Category</th><th>What I like</th><th>How I’ll use it</th></tr></thead>
+                  <tbody>
+                    {markers.map((marker) => (
+                      <tr key={marker.id}>
+                        <td className="time">{formatTime(marker.timestamp)}</td>
+                        <td><CategoryChip category={marker.category} /></td>
+                        <td>{marker.whatILike}</td>
+                        <td>{marker.howIWantToUseIt}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </section>
+            ))}
+          </div>
+        )}
+    </div>
+  );
 }
 
-function SettingsPage({ projects, setProjects, notify }: { projects: Project[]; setProjects: React.Dispatch<React.SetStateAction<Project[]>>; notify: Notice }) {
+/* ---------- Settings ---------- */
+
+function SettingsPage({ projects, setProjects, notify }: { projects: Project[]; setProjects: SetProjects; notify: Notice }) {
   const confirm = useConfirm();
   const demo = seedProjects()[0];
-  const hasDemo = projects.some((project) => project.id === demo.id);
+  const existingDemo = projects.find((project) => project.id === demo.id);
   const loadDemo = () => {
-    const apply = () => { setProjects((items) => [demo, ...items.filter((item) => item.id !== demo.id)]); notify(hasDemo ? 'Demo project restored' : 'Demo project added'); };
-    if (!hasDemo) { apply(); return; }
+    const apply = () => {
+      setProjects((items) => [demo, ...items.filter((item) => item.id !== demo.id)]);
+      if (existingDemo) deleteAudio(existingDemo.references.filter((reference) => reference.audio).map((reference) => reference.id));
+      notify(existingDemo ? 'Demo project restored' : 'Demo project added');
+    };
+    if (!existingDemo) { apply(); return; }
     confirm({ title: 'Restore demo project?', message: `“${demo.title}” will be reset to its original references and markers. Your other projects are not affected.`, confirmLabel: 'Restore demo', onConfirm: apply });
   };
   const clearAll = () => confirm({
-    title: 'Delete all projects?', message: `All ${projects.length} ${projects.length === 1 ? 'project' : 'projects'} will be removed from this browser. You can add the demo project again afterwards.`, confirmLabel: 'Delete everything',
-    onConfirm: () => { setProjects([]); notify('All projects deleted'); },
+    title: 'Delete all projects?', message: `All ${plural(projects.length, 'project')} and uploaded audio files will be removed from this browser. You can add the demo project again afterwards.`, confirmLabel: 'Delete everything',
+    onConfirm: () => { setProjects([]); clearAudio().catch(() => undefined); notify('All projects deleted'); },
   });
-  return <div className="page"><div className="page-header"><div><div className="eyebrow">RefMap / Preferences</div><h1>Settings</h1><p className="subtle" style={{ marginTop: 12 }}>A few notes about how this little room works.</p></div></div><div className="settings-layout"><nav className="settings-nav"><span>About RefMap</span></nav><div>
-    <section className="settings-block"><h3>Built for the listening part</h3><p>RefMap is a quiet workspace for the references that shape a record. It keeps the exact moment, the reason it matters, and the next creative move together.</p></section>
-    <section className="settings-block"><h3>Local by default</h3><p>Your projects, references, and markers are stored in this browser using local storage. Nothing is sent to a server; YouTube videos stream from YouTube when you open a reference. Export your Creative Brief when you are ready to share direction with a collaborator.</p><div className="status-line"><span className="status-dot" /> Local persistence is active</div></section>
-    <section className="settings-block"><h3>Demo data</h3><p>{hasDemo ? `The “${demo.title}” demo project is in your workspace. Restore it to undo any changes you made to it.` : `Add the “${demo.title}” demo project: three YouTube references with markers ready to explore.`}</p><div className="settings-actions"><button className="button button-secondary" onClick={loadDemo} data-testid="button-load-demo">{hasDemo ? 'Restore demo project' : 'Add demo project'}</button><button className="button button-ghost button-danger" onClick={clearAll} disabled={projects.length === 0} data-testid="button-clear-projects"><Trash2 size={14} /> Delete all projects</button></div></section>
-    <section className="settings-block"><h3>RefMap</h3><p>Version 1.0 · A session notebook for artists, producers, and engineers.</p></section>
-  </div></div></div>;
+  return (
+    <div className="page page-narrow">
+      <PageHeader title="Settings" />
+      <section className="settings-section">
+        <h2>Storage</h2>
+        <p>Projects and markers are saved in this browser’s local storage. Uploaded audio files are stored in this browser too (IndexedDB) and are never uploaded. Files can be up to {formatBytes(maxAudioBytes)}. YouTube videos stream from YouTube.</p>
+        <p className="status-line"><span className="status-dot" /> Saving to this browser</p>
+      </section>
+      <section className="settings-section">
+        <h2>Demo project</h2>
+        <p>{existingDemo ? `“${demo.title}” is in your projects. Restore it to undo changes you made to it.` : `Add “${demo.title}”: three YouTube references with markers to explore.`}</p>
+        <div className="settings-actions">
+          <button className="button" onClick={loadDemo} data-testid="button-load-demo">{existingDemo ? 'Restore demo project' : 'Add demo project'}</button>
+          <button className="button button-danger-quiet" onClick={clearAll} disabled={projects.length === 0} data-testid="button-clear-projects"><Trash2 size={14} /> Delete all projects</button>
+        </div>
+      </section>
+      <section className="settings-section">
+        <h2>Keyboard shortcuts</h2>
+        <dl className="shortcuts">
+          <div><dt><kbd>Space</kbd></dt><dd>Play or pause</dd></div>
+          <div><dt><kbd>M</kbd></dt><dd>Add a marker at the current time</dd></div>
+          <div><dt><kbd>←</kbd> <kbd>→</kbd></dt><dd>Move 5 seconds (hold Shift for 15)</dd></div>
+          <div><dt><kbd>Esc</kbd></dt><dd>Close a dialog</dd></div>
+        </dl>
+      </section>
+      <section className="settings-section">
+        <h2>About</h2>
+        <p>RefMap 1.1 · Organise reference tracks and turn the moments you like into a creative brief.</p>
+      </section>
+    </div>
+  );
 }
+
+/* ---------- Dialogs ---------- */
 
 function FieldError({ message }: { message?: string }) {
   return message ? <p className="form-error" role="alert">{message}</p> : null;
+}
+
+function Field({ label, htmlFor, optional, children }: { label: string; htmlFor: string; optional?: boolean; children: ReactNode }) {
+  return <div className="field"><label className="field-label" htmlFor={htmlFor}>{label}{optional && <span className="optional"> (optional)</span>}</label>{children}</div>;
 }
 
 function ProjectModal({ mode, initial, onClose, onSave }: { mode: 'new' | 'edit'; initial?: Project; onClose: () => void; onSave: (data: Pick<Project, 'title' | 'artist' | 'description'>) => void }) {
@@ -415,27 +835,112 @@ function ProjectModal({ mode, initial, onClose, onSave }: { mode: 'new' | 'edit'
   const [error, setError] = useState('');
   useEffect(() => { setTitle(initial?.title || ''); setArtist(initial?.artist || ''); setDescription(initial?.description || ''); }, [initial?.id]);
   const submit = (event: FormEvent) => { event.preventDefault(); if (!title.trim()) { setError('Give the project a title.'); return; } onSave({ title: title.trim(), artist: artist.trim(), description: description.trim() }); };
-  return <Modal title={mode === 'new' ? 'New project' : 'Edit project'} onClose={onClose}><form onSubmit={submit} noValidate><div className="form-grid"><div><label className="form-label" htmlFor="project-title">Project title</label><input id="project-title" className="input" autoFocus value={title} onChange={(event) => { setTitle(event.target.value); setError(''); }} aria-invalid={!!error} placeholder="e.g. Night Transit" data-testid="input-project-title" /><FieldError message={error} /></div><div><label className="form-label" htmlFor="project-artist">Artist / project name</label><input id="project-artist" className="input" value={artist} onChange={(event) => setArtist(event.target.value)} placeholder="Who is this for?" data-testid="input-project-artist" /></div><div><label className="form-label" htmlFor="project-description">Description</label><textarea id="project-description" className="textarea" value={description} onChange={(event) => setDescription(event.target.value)} placeholder="What are you trying to make?" data-testid="input-project-description" /></div></div><div className="modal-footer"><button type="button" className="button button-secondary" onClick={onClose} data-testid="button-cancel-project">Cancel</button><button type="submit" className="button button-primary" data-testid="button-save-project"><Check size={14} /> {mode === 'new' ? 'Create project' : 'Save changes'}</button></div></form></Modal>;
+  return (
+    <Modal title={mode === 'new' ? 'New project' : 'Edit project'} onClose={onClose}>
+      <form onSubmit={submit} noValidate>
+        <div className="form-grid">
+          <Field label="Title" htmlFor="project-title"><input id="project-title" className="input" autoFocus value={title} onChange={(event) => { setTitle(event.target.value); setError(''); }} aria-invalid={!!error} placeholder="e.g. Night Transit" data-testid="input-project-title" /><FieldError message={error} /></Field>
+          <Field label="Artist" htmlFor="project-artist" optional><input id="project-artist" className="input" value={artist} onChange={(event) => setArtist(event.target.value)} placeholder="Who is it for?" data-testid="input-project-artist" /></Field>
+          <Field label="Description" htmlFor="project-description" optional><textarea id="project-description" className="textarea" value={description} onChange={(event) => setDescription(event.target.value)} placeholder="What are you going for?" data-testid="input-project-description" /></Field>
+        </div>
+        <div className="modal-footer">
+          <button type="button" className="button" onClick={onClose} data-testid="button-cancel-project">Cancel</button>
+          <button type="submit" className="button button-primary" data-testid="button-save-project"><Check size={15} /> {mode === 'new' ? 'Create project' : 'Save changes'}</button>
+        </div>
+      </form>
+    </Modal>
+  );
 }
 
-function ReferenceModal({ initial, onClose, onSave }: { initial?: Reference; onClose: () => void; onSave: (data: Omit<Reference, 'id' | 'markers'>) => void }) {
+type ReferenceErrors = Partial<Record<'title' | 'artist' | 'url' | 'artwork' | 'file', string>>;
+
+function ReferenceModal({ initial, onClose, onSave }: { initial?: Reference; onClose: () => void; onSave: (data: ReferenceInput, file: File | null) => Promise<void> }) {
+  const [source, setSource] = useState<'link' | 'audio'>(initial?.audio ? 'audio' : 'link');
   const [title, setTitle] = useState(initial?.title || ''); const [artist, setArtist] = useState(initial?.artist || ''); const [url, setUrl] = useState(initial?.url || ''); const [artwork, setArtwork] = useState(initial?.artwork || ''); const [notes, setNotes] = useState(initial?.notes || '');
-  const [errors, setErrors] = useState<Partial<Record<'title' | 'artist' | 'url' | 'artwork', string>>>({});
-  useEffect(() => { setTitle(initial?.title || ''); setArtist(initial?.artist || ''); setUrl(initial?.url || ''); setArtwork(initial?.artwork || ''); setNotes(initial?.notes || ''); }, [initial?.id]);
-  const clearError = (field: keyof typeof errors) => setErrors(({ [field]: _, ...rest }) => rest);
-  const submit = (event: FormEvent) => {
+  const [file, setFile] = useState<File | null>(null);
+  const [errors, setErrors] = useState<ReferenceErrors>({});
+  const [saving, setSaving] = useState(false);
+  const clearError = (field: keyof ReferenceErrors) => setErrors(({ [field]: _, ...rest }) => rest);
+  const chooseFile = (chosen: File) => {
+    const problem = validateAudioFile(chosen);
+    if (problem) { setErrors((current) => ({ ...current, file: problem })); return; }
+    setFile(chosen); clearError('file');
+    if (!title.trim()) { setTitle(chosen.name.replace(/\.[^.]+$/, '').replace(/[_-]+/g, ' ').trim()); clearError('title'); }
+  };
+  const submit = async (event: FormEvent) => {
     event.preventDefault();
-    const next: typeof errors = {};
+    const next: ReferenceErrors = {};
     if (!title.trim()) next.title = 'Add the song title.';
     if (!artist.trim()) next.artist = 'Add the artist.';
     if (url.trim() && !isHttpUrl(url.trim())) next.url = 'Enter a full link starting with https://';
     if (artwork.trim() && !isHttpUrl(artwork.trim())) next.artwork = 'Enter a full image link starting with https://';
+    if (source === 'audio' && !file && !initial?.audio) next.file = 'Choose an audio file.';
     setErrors(next);
     if (Object.keys(next).length) return;
-    onSave({ title: title.trim(), artist: artist.trim(), url: url.trim(), artwork: artwork.trim(), notes: notes.trim() });
+    const audio = source === 'audio' ? (file ? { name: file.name, size: file.size, type: file.type } : initial?.audio) : undefined;
+    setSaving(true);
+    try {
+      await onSave({ title: title.trim(), artist: artist.trim(), url: url.trim(), artwork: artwork.trim(), notes: notes.trim(), audio }, source === 'audio' ? file : null);
+    } catch {
+      setErrors({ file: 'Could not save the audio file — browser storage is full or blocked.' });
+      setSaving(false);
+    }
   };
-  const youTubeHint = url.trim() && isHttpUrl(url.trim()) ? (getYouTubeVideoId(url) ? 'YouTube video detected — it will play inside RefMap.' : 'Not a YouTube video link — it will open in a new tab instead.') : 'YouTube links play inside RefMap so you can mark moments while you listen.';
-  return <Modal title={initial ? 'Edit reference' : 'Add reference'} onClose={onClose}><form onSubmit={submit} noValidate><div className="form-grid"><div><label className="form-label" htmlFor="reference-title">Song title</label><input id="reference-title" className="input" autoFocus value={title} onChange={(event) => { setTitle(event.target.value); clearError('title'); }} aria-invalid={!!errors.title} placeholder="A moment worth returning to" data-testid="input-reference-title" /><FieldError message={errors.title} /></div><div><label className="form-label" htmlFor="reference-artist">Artist</label><input id="reference-artist" className="input" value={artist} onChange={(event) => { setArtist(event.target.value); clearError('artist'); }} aria-invalid={!!errors.artist} placeholder="Artist name" data-testid="input-reference-artist" /><FieldError message={errors.artist} /></div><div><label className="form-label" htmlFor="reference-url">External URL <span style={{ textTransform: 'none', letterSpacing: 0 }}>(optional)</span></label><input id="reference-url" className="input" type="url" value={url} onChange={(event) => { setUrl(event.target.value); clearError('url'); }} aria-invalid={!!errors.url} placeholder="https://youtube.com/watch?v=…" data-testid="input-reference-url" />{errors.url ? <FieldError message={errors.url} /> : <p className="form-hint" data-testid="text-url-hint">{youTubeHint}</p>}</div><div><label className="form-label" htmlFor="reference-artwork">Artwork URL <span style={{ textTransform: 'none', letterSpacing: 0 }}>(optional)</span></label><input id="reference-artwork" className="input" type="url" value={artwork} onChange={(event) => { setArtwork(event.target.value); clearError('artwork'); }} aria-invalid={!!errors.artwork} placeholder="https://" data-testid="input-reference-artwork" /><FieldError message={errors.artwork} /></div><div><label className="form-label" htmlFor="reference-notes">Why is it here?</label><textarea id="reference-notes" className="textarea" value={notes} onChange={(event) => setNotes(event.target.value)} placeholder="The feeling, move, or detail to listen for." data-testid="input-reference-notes" /></div></div><div className="modal-footer"><button type="button" className="button button-secondary" onClick={onClose} data-testid="button-cancel-reference">Cancel</button><button type="submit" className="button button-primary" data-testid="button-save-reference"><Check size={14} /> {initial ? 'Save changes' : 'Add reference'}</button></div></form></Modal>;
+  const urlHint = url.trim() && isHttpUrl(url.trim())
+    ? (getYouTubeVideoId(url) ? (source === 'audio' ? 'YouTube link saved for reference; the audio file is what plays here.' : 'YouTube video detected — it will play inside RefMap.') : 'Not a YouTube video — it will open in a new tab.')
+    : source === 'audio' ? 'Optional link to the original track.' : 'YouTube links play inside RefMap. Other links open in a new tab.';
+  return (
+    <Modal title={initial ? 'Edit reference' : 'Add reference'} onClose={onClose}>
+      <form onSubmit={submit} noValidate>
+        <div className="form-grid">
+          <div className="field">
+            <span className="field-label" id="reference-source-label">Source</span>
+            <Segmented<typeof source> label="Source" value={source} onChange={(value) => { setSource(value); clearError('file'); }} options={[{ value: 'link', label: 'YouTube or link', testId: 'button-source-link' }, { value: 'audio', label: 'Audio file', testId: 'button-source-audio' }]} />
+          </div>
+          {source === 'audio' && <Field label="Audio file" htmlFor="reference-file"><AudioDropzone file={file} current={initial?.audio} invalid={!!errors.file} onFile={chooseFile} /><FieldError message={errors.file} /></Field>}
+          <Field label={source === 'audio' ? 'Link' : 'YouTube or other link'} htmlFor="reference-url" optional={source === 'audio'}>
+            <input id="reference-url" className="input" type="url" value={url} onChange={(event) => { setUrl(event.target.value); clearError('url'); }} aria-invalid={!!errors.url} placeholder="https://youtube.com/watch?v=…" data-testid="input-reference-url" />
+            {errors.url ? <FieldError message={errors.url} /> : <p className="form-hint" data-testid="text-url-hint">{urlHint}</p>}
+          </Field>
+          <div className="field-row">
+            <Field label="Song title" htmlFor="reference-title"><input id="reference-title" className="input" autoFocus={!!initial || source === 'link'} value={title} onChange={(event) => { setTitle(event.target.value); clearError('title'); }} aria-invalid={!!errors.title} placeholder="Song title" data-testid="input-reference-title" /><FieldError message={errors.title} /></Field>
+            <Field label="Artist" htmlFor="reference-artist"><input id="reference-artist" className="input" value={artist} onChange={(event) => { setArtist(event.target.value); clearError('artist'); }} aria-invalid={!!errors.artist} placeholder="Artist" data-testid="input-reference-artist" /><FieldError message={errors.artist} /></Field>
+          </div>
+          <Field label="Artwork image link" htmlFor="reference-artwork" optional><input id="reference-artwork" className="input" type="url" value={artwork} onChange={(event) => { setArtwork(event.target.value); clearError('artwork'); }} aria-invalid={!!errors.artwork} placeholder="https://…" data-testid="input-reference-artwork" /><FieldError message={errors.artwork} /></Field>
+          <Field label="Notes" htmlFor="reference-notes" optional><textarea id="reference-notes" className="textarea" value={notes} onChange={(event) => setNotes(event.target.value)} placeholder="What should you listen for?" data-testid="input-reference-notes" /></Field>
+        </div>
+        <div className="modal-footer">
+          <button type="button" className="button" onClick={onClose} data-testid="button-cancel-reference">Cancel</button>
+          <button type="submit" className="button button-primary" disabled={saving} data-testid="button-save-reference"><Check size={15} /> {saving ? 'Saving…' : initial ? 'Save changes' : 'Add reference'}</button>
+        </div>
+      </form>
+    </Modal>
+  );
+}
+
+function AudioDropzone({ file, current, invalid, onFile }: { file: File | null; current?: AudioMeta; invalid: boolean; onFile: (file: File) => void }) {
+  const [dragging, setDragging] = useState(false);
+  const onDrop = (event: DragEvent) => {
+    event.preventDefault(); setDragging(false);
+    const dropped = event.dataTransfer.files?.[0];
+    if (dropped) onFile(dropped);
+  };
+  const shown = file ? { name: file.name, size: file.size, note: 'Ready to save' } : current ? { name: current.name, size: current.size, note: 'Current file — choose another to replace it' } : null;
+  return (
+    <label
+      className={`dropzone ${dragging ? 'is-dragging' : ''} ${invalid ? 'is-invalid' : ''} ${shown ? 'has-file' : ''}`}
+      onDragOver={(event) => { event.preventDefault(); setDragging(true); }}
+      onDragLeave={() => setDragging(false)}
+      onDrop={onDrop}
+      data-testid="dropzone-audio"
+    >
+      <input id="reference-file" type="file" accept={audioAccept} className="visually-hidden" onChange={(event) => { const chosen = event.target.files?.[0]; event.target.value = ''; if (chosen) onFile(chosen); }} data-testid="input-reference-file" />
+      {shown ? <FileAudio size={20} aria-hidden="true" /> : <Upload size={20} aria-hidden="true" />}
+      <span className="dropzone-text">
+        {shown ? <><strong>{shown.name}</strong><span>{formatBytes(shown.size)} · {shown.note}</span></> : <><strong>Drop an audio file or click to browse</strong><span>MP3, WAV, M4A, OGG or FLAC · up to {formatBytes(maxAudioBytes)} · stays in this browser</span></>}
+      </span>
+    </label>
+  );
 }
 
 function MarkerModal({ initial, timestamp, onClose, onSave }: { initial?: Marker; timestamp: number; onClose: () => void; onSave: (data: Omit<Marker, 'id' | 'createdAt'>) => void }) {
@@ -453,20 +958,50 @@ function MarkerModal({ initial, timestamp, onClose, onSave }: { initial?: Marker
     if (seconds === null || Object.keys(next).length) return;
     onSave({ timestamp: seconds, category, whatILike: whatILike.trim(), howIWantToUseIt: howIWantToUseIt.trim() });
   };
-  return <Modal title={initial ? 'Edit marker' : 'Capture a moment'} onClose={onClose}><form onSubmit={submit} noValidate><div className="form-grid"><div><label className="form-label" htmlFor="marker-time">Timestamp</label><input id="marker-time" className="input" value={time} onChange={(event) => { setTime(event.target.value); clearError('time'); }} aria-invalid={!!errors.time} placeholder="1:32" data-testid="input-marker-timestamp" /><FieldError message={errors.time} /></div><div><label className="form-label" htmlFor="marker-category">Creative category</label><select id="marker-category" className="select" value={category} onChange={(event) => setCategory(event.target.value as Category)} data-testid="select-marker-category">{categories.map((item) => <option key={item} value={item}>{item}</option>)}</select></div><div><label className="form-label" htmlFor="marker-like">What I like</label><textarea id="marker-like" className="textarea" autoFocus={!initial} value={whatILike} onChange={(event) => { setWhatILike(event.target.value); clearError('like'); }} aria-invalid={!!errors.like} placeholder="Name the exact thing you hear." data-testid="input-marker-like" /><FieldError message={errors.like} /></div><div><label className="form-label" htmlFor="marker-use">How I want to use it</label><textarea id="marker-use" className="textarea" value={howIWantToUseIt} onChange={(event) => { setHowIWantToUseIt(event.target.value); clearError('use'); }} aria-invalid={!!errors.use} placeholder="Translate the instinct into a move for this record." data-testid="input-marker-use" /><FieldError message={errors.use} /></div></div><div className="modal-footer"><button type="button" className="button button-secondary" onClick={onClose} data-testid="button-cancel-marker">Cancel</button><button type="submit" className="button button-primary" data-testid="button-save-marker"><Check size={14} /> {initial ? 'Save marker' : 'Capture marker'}</button></div></form></Modal>;
+  return (
+    <Modal title={initial ? 'Edit marker' : 'Add marker'} onClose={onClose}>
+      <form onSubmit={submit} noValidate>
+        <div className="form-grid">
+          <div className="field-row field-row-narrow">
+            <Field label="Time" htmlFor="marker-time"><input id="marker-time" className="input input-time" value={time} onChange={(event) => { setTime(event.target.value); clearError('time'); }} aria-invalid={!!errors.time} placeholder="1:32" data-testid="input-marker-timestamp" /><FieldError message={errors.time} /></Field>
+            <Field label="Category" htmlFor="marker-category">
+              <div className="category-picker" role="radiogroup" aria-label="Category" id="marker-category">
+                {categories.map((item) => (
+                  <button key={item} type="button" role="radio" aria-checked={category === item} className={`filter ${category === item ? 'active' : ''}`} style={{ '--c': categoryColors[item] } as CSSProperties} onClick={() => setCategory(item)} data-testid={`button-marker-category-${item.toLowerCase()}`}><i aria-hidden="true" />{item}</button>
+                ))}
+              </div>
+            </Field>
+          </div>
+          <Field label="What I like" htmlFor="marker-like"><textarea id="marker-like" className="textarea" autoFocus={!initial} value={whatILike} onChange={(event) => { setWhatILike(event.target.value); clearError('like'); }} aria-invalid={!!errors.like} placeholder="The exact thing you hear" data-testid="input-marker-like" /><FieldError message={errors.like} /></Field>
+          <Field label="How I’ll use it" htmlFor="marker-use"><textarea id="marker-use" className="textarea" value={howIWantToUseIt} onChange={(event) => { setHowIWantToUseIt(event.target.value); clearError('use'); }} aria-invalid={!!errors.use} placeholder="What you’ll do with it in your track" data-testid="input-marker-use" /><FieldError message={errors.use} /></Field>
+        </div>
+        <div className="modal-footer">
+          <button type="button" className="button" onClick={onClose} data-testid="button-cancel-marker">Cancel</button>
+          <button type="submit" className="button button-primary" data-testid="button-save-marker"><Check size={15} /> {initial ? 'Save marker' : 'Add marker'}</button>
+        </div>
+      </form>
+    </Modal>
+  );
 }
 
-function Modal({ title, onClose, children }: { title: string; onClose: () => void; children: ReactNode }) {
+function Modal({ title, onClose, children, size }: { title: string; onClose: () => void; children: ReactNode; size?: 'small' }) {
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => { if (event.key === 'Escape') onClose(); };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
   }, [onClose]);
-  return <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}><div className="modal" role="dialog" aria-modal="true" aria-label={title}><div className="modal-header"><h2>{title}</h2><button className="icon-button" onClick={onClose} aria-label="Close dialog" data-testid="button-close-modal"><X size={17} /></button></div><div className="modal-body">{children}</div></div></div>;
+  return (
+    <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
+      <div className={`modal ${size === 'small' ? 'modal-small' : ''}`} role="dialog" aria-modal="true" aria-label={title}>
+        <div className="modal-header"><h2>{title}</h2><IconButton label="Close dialog" onClick={onClose} testId="button-close-modal"><X size={17} /></IconButton></div>
+        <div className="modal-body">{children}</div>
+      </div>
+    </div>
+  );
 }
 
 function Missing({ title, back }: { title: string; back: string }) {
-  return <div className="page"><div className="empty-state"><Disc3 size={29} /><h3>{title}</h3><p>The thing you are looking for may have moved or been deleted.</p><Link href={back} className="button button-primary" data-testid="link-missing-back"><ArrowLeft size={14} /> Go back</Link></div></div>;
+  return <div className="page"><EmptyState icon={Disc3} title={title} body="It may have been moved or deleted." action={<Link href={back} className="button" data-testid="link-missing-back">Go back</Link>} /></div>;
 }
 
 function NotFound() {
